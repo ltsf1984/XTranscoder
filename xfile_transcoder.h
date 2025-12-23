@@ -6,6 +6,7 @@
 
 extern "C" {
 #include <libavcodec/codec_id.h>
+#include <libswscale/swscale.h>
 }
 
 // 前向声明 FFmpeg 结构体（避免包含重型头文件）
@@ -59,15 +60,20 @@ private:
 	void Cleanup();
 
 private:
+	//解封器，封装器
 	XDemuxer* demuxer_{ nullptr };
 	XMuxer* muxer_{ nullptr };
 
-private:
 	//编码器，解码器，
 	XEncoder* video_encoder_{ nullptr };
 	XEncoder* audio_encoder_{ nullptr };
 	XDecoder* video_decoder_{ nullptr };
 	XDecoder* audio_decoder_{ nullptr };
+
+	// 视频缩放上下文
+	SwsContext* sws_video_ctx_{ nullptr };
+	AVFrame* scaled_video_frame_{ nullptr };
+
 	//视频流索引
 	int video_frame_counter_{ 0 };
 	int audio_frame_counter_{ 0 };

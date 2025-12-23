@@ -16,6 +16,7 @@ extern "C" {
 #pragma comment(lib, "avformat.lib")
 #pragma comment(lib, "avcodec.lib")
 #pragma comment(lib, "avutil.lib")
+#pragma comment(lib, "swscale.lib")
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -105,6 +106,8 @@ bool XFileTranscoder::Transcode(
 
 	AVPacket* pkt = av_packet_alloc();
 	AVFrame* frame = av_frame_alloc();
+	// 初始化缩放帧（即使不用，也分配，避免 nullptr 检查）
+	scaled_video_frame_ = av_frame_alloc();
 
 	XDecoder* decoder = nullptr;
 	XEncoder* encoder = nullptr;
@@ -186,7 +189,54 @@ bool XFileTranscoder::Transcode(
 			// 重要的：设置pict_type，让编码器自动决定
 			frame->pict_type = AV_PICTURE_TYPE_NONE;
 
-			auto send_ret = encoder->SendFrame(frame);
+			// 帧缩放处理
+			AVFrame* frame_to_encode = frame;
+			if (stream_index == demuxer_->video_index() && sws_video_ctx_)
+			{
+				int dst_width = video_encoder_->GetContext()->width;
+				int dst_height = video_encoder_->GetContext()->height;
+				AVPixelFormat dst_pix_fmt = video_encoder_->GetContext()->pix_fmt;
+
+				if (scaled_video_frame_->width != dst_width ||
+					scaled_video_frame_->height != dst_height ||
+					scaled_video_frame_->format != dst_pix_fmt)
+				{
+					// 先释放旧缓冲区
+					av_frame_unref(scaled_video_frame_);
+
+					// 设置新参数
+					scaled_video_frame_->width = dst_width;
+					scaled_video_frame_->height = dst_height;
+					scaled_video_frame_->format = dst_pix_fmt;
+
+					if (av_frame_get_buffer(scaled_video_frame_, 0) < 0)
+					{
+						std::cerr << "Error: av_frame_get_buffer for scaled frame failed!" << std::endl;
+						is_successed = false;
+						goto cleanup;
+					}
+				}
+
+				// 执行缩放
+				int ret = sws_scale(sws_video_ctx_,
+					frame->data, frame->linesize, 0, frame->height,
+					scaled_video_frame_->data, scaled_video_frame_->linesize);
+				if (ret < 0) {
+					std::cerr << "Error: sws_scale failed!" << std::endl;
+					is_successed = false;
+					goto cleanup;
+				}
+
+				scaled_video_frame_->pts = frame->pts;
+				scaled_video_frame_->pkt_dts = frame->pkt_dts;
+				scaled_video_frame_->best_effort_timestamp = frame->best_effort_timestamp;
+				scaled_video_frame_->key_frame = frame->key_frame;
+				scaled_video_frame_->pict_type = AV_PICTURE_TYPE_NONE;
+
+				frame_to_encode = scaled_video_frame_;
+			}
+
+			auto send_ret = encoder->SendFrame(frame_to_encode);
 			if (send_ret == XEncoder::SendResult::Failed)
 			{
 				is_successed = false;
@@ -320,6 +370,20 @@ XEncoder* XFileTranscoder::SetupVideoEncoder(
 	int fps
 )
 {
+	if (!video_decoder_)
+	{
+		std::cerr << "Error: video decoder is not initialized!" << std::endl;
+		return nullptr;
+	}
+
+	// 默认使用原始尺寸，如果设置了宽、高就使用设置值
+	int src_width = video_decoder_->GetContext()->width;
+	int src_height = video_decoder_->GetContext()->height;
+	AVPixelFormat pix_fmt = video_decoder_->GetContext()->pix_fmt;
+	if (width <= 0) width = src_width;
+	if (height <= 0) height = src_height;
+
+
 	XEncoder* encoder = new XEncoder();
 	// 创建编码器
 	if (!encoder->Create(codec_id))
@@ -329,7 +393,6 @@ XEncoder* XFileTranscoder::SetupVideoEncoder(
 		return nullptr;
 	}
 
-	AVPixelFormat pix_fmt = video_decoder_->GetContext()->pix_fmt;
 	encoder->SetVideoParam(width, height, pix_fmt);
 	encoder->SetTimeBase(1, fps);
 	encoder->SetFrameRate(fps, 1);
@@ -339,6 +402,29 @@ XEncoder* XFileTranscoder::SetupVideoEncoder(
 		std::cerr << "Error: encoder open failed!" << std::endl;
 		delete encoder;
 		return nullptr;
+	}
+
+	// 设置缩放上下文
+	if (sws_video_ctx_)
+	{
+		sws_freeContext(sws_video_ctx_);
+		sws_video_ctx_ = nullptr;
+	}
+
+	// 如果原宽、高和目标宽、高不相等则进行缩放
+	if (width != src_width || height != src_height)
+	{
+		sws_video_ctx_ = sws_getContext(
+			src_width, src_height, pix_fmt,
+			width, height, pix_fmt,
+			SWS_BICUBIC,
+			nullptr, nullptr, nullptr);
+		if (!sws_video_ctx_)
+		{
+			std::cerr << "Error: Failed to create scaling context!" << std::endl;
+			delete encoder;
+			return nullptr;
+		}
 	}
 
 	return encoder;
@@ -394,6 +480,8 @@ bool XFileTranscoder::FlushDecoder()
 			{
 				break;
 			}
+
+
 
 			//时间基 输入流 -> 编码器
 			auto pts = frame->best_effort_timestamp;
@@ -545,34 +633,34 @@ cleanup:
 void XFileTranscoder::Cleanup()
 {
 	// 关闭并清理编码器，解码器
-	if(video_encoder_) 
+	if (video_encoder_)
 	{
 		video_encoder_->Close();
 		video_encoder_ = nullptr;
 	}
-	if (audio_encoder_) 
+	if (audio_encoder_)
 	{
 		audio_encoder_->Close();
 		audio_encoder_ = nullptr;
 	}
-	if (video_decoder_) 
+	if (video_decoder_)
 	{
 		video_decoder_->Close();
 		video_decoder_ = nullptr;
 	}
-	if (audio_decoder_) 
+	if (audio_decoder_)
 	{
 		audio_decoder_->Close();
 		audio_decoder_ = nullptr;
 	}
 
 	// 关闭并清理封装器，解封装器
-	if (muxer_) 
+	if (muxer_)
 	{
 		muxer_->Close();
 		muxer_ = nullptr;
 	}
-	if (demuxer_) 
+	if (demuxer_)
 	{
 		demuxer_->Close();
 		demuxer_ = nullptr;
